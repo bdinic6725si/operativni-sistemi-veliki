@@ -30,13 +30,13 @@ void queue_col(short);
 void remove_col(short);
 
 int send_tm(short);
-void end_tm(short, short, short);
+void end_tm(short);
 struct timespec get_next_tm(void);
 
 int pc_ids[PC_CNT * sizeof(int)]; // better way to do this?
 struct racunar_t pcs[PC_CNT];
 pthread_t pc_threads[PC_CNT];
-short collisions[PC_CNT];
+short collisions[PC_CNT] = {0};
 
 struct magistrala_t mag;
 uint64_t start_time;
@@ -51,6 +51,7 @@ int tm_total = 0; // total successful transmissions
 uint64_t end_time; // time when the sim should end (start + SIM_LEN)
 
 int total_intrpts = 0;
+int total_colls = 0;
 
 int get_lag_time(int interrupt_cnt) {
     int lag;
@@ -67,14 +68,15 @@ void print_stats_per_s() {
     printf("Sec: %d\n", (int)((curr_time - start_time) / MICRO_TO_S));
     printf("Uspesnih transmisija u prosloj sekundi: %d\n", mag.brojac);
     printf("Ukupno uspesnih transmisija: %d\n", tm_total);
-    printf("Ukupno prekidanja: %d\n", total_intrpts);
+    printf("Ukupno prekida: %d\n", total_intrpts);
     printf("-------------------------\n");
 }
 void final_print() {
     printf("Simulacija zavrsena!\n");
-    printf("Procenat iskoriscenja mreze: %f%\n", ((float)tm_total / (float)MAX_MAG_USAGE) * 100); // get percentage
+    printf("Procenat iskoriscenja mreze: %f%%\n", ((float)tm_total / (float)MAX_MAG_USAGE) * 100); // get percentage
     printf("Ukupno uspesnih transmisija: %d\n", tm_total);
     printf("Ukupno prekida: %d\n", total_intrpts);
+    printf("Na %d kolizija\n", total_colls);
     printf("-------------------------\n");
 }
 
@@ -127,11 +129,11 @@ void remove_col(short id) {
 
 struct timespec get_next_tm() {
     struct timespec ts;
-    int tm_len = TM_LEN * 1000; // micro to nano
+    long tm_len = TM_LEN * 1000L; // micro to nano
 
     // start time
     ts.tv_sec = mag.pt / MICRO_TO_S;
-    ts.tv_nsec = (mag.pt % MICRO_TO_S) * 1000;
+    ts.tv_nsec = (mag.pt % MICRO_TO_S) * 1000L;
 
     // target time
     ts.tv_nsec += tm_len;
@@ -157,7 +159,7 @@ void* transmit(void* atr) {
             while (!ts_stopped) {
                 int res = pthread_cond_timedwait(&tm_intrpt_cond, &tm_lock, &ts);
                 if (res == ETIMEDOUT) { // Not interrupted, tm ended naturally
-                    end_tm(0, 0, 0);
+                    end_tm(!INTRPTED);
                     break;
                 }
             }
@@ -167,35 +169,40 @@ void* transmit(void* atr) {
     return NULL;
 }
 
-int send_tm(short id) { // returns 1 if successful
+int send_tm(short id) { // returns 1 if successful or col in 2ms
     sem_wait(&sem);
+
     if (mag.racunar_id == FREE_MAG) {
         mag.racunar_id = id;
         mag.pt = curr_time;
         sem_post(&sem);
         return 1;
     }
+    if (curr_time - mag.pt < 2000) { // Collision
+        sem_post(&sem);
+        return 1;
+    }
+
     sem_post(&sem);
     return 0;
 }
 
-void end_tm(short intrpt, short id_1, short id_2) {
-    if (mag.racunar_id == FREE_MAG)
-        return;
+void end_tm(short intrpt) {
 
     sem_wait(&sem);
 
+    if (mag.racunar_id == FREE_MAG) {
+        sem_post(&sem);
+        return;
+    }
+
     if (intrpt) { // interrupted transmission
         total_intrpts++;
-
-        queue_col(id_1);
-        queue_col(id_2);
-
-            // stop ts
-            pthread_mutex_lock(&tm_lock);
-            ts_stopped = 1;
-            pthread_cond_signal(&tm_intrpt_cond);
-            pthread_mutex_unlock(&tm_lock);
+        for (int i = 0; i < PC_CNT; i++) {
+            if (collisions[i]) {
+                total_colls++;
+            }
+        }
         } else // successful transmission
             mag.brojac++;
 
@@ -209,17 +216,29 @@ int get_tm_wait() { // microsecs
 }
 
 void* control_pcs(void* atr) {
-    short occupied = 0;
+    short occupied_cnt;
 
     while(is_running()) {
+
+        occupied_cnt = 0;
+        pthread_mutex_lock(&tm_lock);
+
         for (int i = 0; i < PC_CNT; i++)
             if (pcs[i].stanje == 0) {
-                if (occupied) {
-                    end_tm(INTRPTED, i, occupied);
-                    break;
-                }
-                occupied = i;
+                occupied_cnt++;
             }
+        if (occupied_cnt > 1) {
+            for (int i = 0; i < PC_CNT; i++) {
+              if (pcs[i].stanje == 0)
+                  collisions[i] = 1;
+            }
+
+            // stop ts
+            ts_stopped = 1;
+            end_tm(INTRPTED);
+            pthread_cond_signal(&tm_intrpt_cond);
+        }
+        pthread_mutex_unlock(&tm_lock);
         usleep(1000);
     }
     return NULL;
@@ -228,31 +247,30 @@ void* control_pcs(void* atr) {
 void* handle_pc(void* atr) {
     short id = *(int*) atr;
 
-
     while (is_running()) {
 
-        // If another PC collided with this one
-        if (collisions[id]) {
-            remove_col(id);
-            pcs[id].k++;
+        // ready for next tm
+        if (pcs[id].stanje == 1) {
+            if (send_tm(id)) {
+                pcs[id].stanje = 0;
 
+                usleep(TM_LEN);
+
+                // Successful tm
+                if (!collisions[id]) {
+                    pcs[id].k = 0;
+                    pcs[id].stanje = 1;
+                    usleep(get_tm_wait() - TM_LEN);
+                }
+            }
+        // Collision
+        } else {
+            pcs[id].k++;
             pcs[id].stanje = 2;
-            usleep(get_lag_time(pcs[id].k) * MICRO_TO_S); // Collisions in a row
+            usleep(get_lag_time(pcs[id].k) * 1000);
             pcs[id].stanje = 1;
-            continue;
+
         }
-        // pokreni transmisiju
-        if (pcs[id].stanje == 1 && send_tm(id)) {
-            pcs[id].k = 0;
-            usleep(get_tm_wait());
-            pcs[id].k = 1;
-            continue;
-        }
-        // failed tm
-        pcs[id].k++;
-        pcs[id].stanje = 2;
-        usleep(get_lag_time(pcs[id].k));
-        pcs[id].stanje = 1;
     }
     return NULL;
 }
@@ -260,6 +278,12 @@ void* handle_pc(void* atr) {
 int main(int argc, char *argv[]) {
     printf("Started!\n");
     printf("-------------------------\n");
+
+    // Init stanja
+    for (int i = 0; i < PC_CNT; i++) {
+        pcs[i].stanje = 1;
+        pcs[i].k = 0;
+    }
 
     // Init time
     struct timeval tv;
