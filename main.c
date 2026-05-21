@@ -111,6 +111,11 @@ void* handle_brojac(void* atr) { // Handle timers
 
         usleep(1000); // 1000 microsecs - 1 ms
     }
+
+    // Last part of last sec
+    tm_total += mag.brojac;
+    mag.brojac = 0;
+
     return NULL;
 }
 
@@ -203,8 +208,8 @@ void end_tm(short intrpt) {
                 total_colls++;
             }
         }
-        } else // successful transmission
-            mag.brojac++;
+    } else // successful transmission
+        mag.brojac++;
 
     mag.racunar_id = FREE_MAG;
 
@@ -247,6 +252,7 @@ void* control_pcs(void* atr) {
 void* handle_pc(void* atr) {
     short id = *(int*) atr;
 
+    usleep(get_tm_wait());
     while (is_running()) {
 
         // ready for next tm
@@ -261,15 +267,22 @@ void* handle_pc(void* atr) {
                     pcs[id].k = 0;
                     pcs[id].stanje = 1;
                     usleep(get_tm_wait() - TM_LEN);
+                } else {
+                    pcs[id].stanje = 2;
                 }
+            } else {
+                usleep(1000);
             }
         // Collision
         } else {
+            remove_col(id);
             pcs[id].k++;
             pcs[id].stanje = 2;
-            usleep(get_lag_time(pcs[id].k) * 1000);
+            long lag_time = get_lag_time(pcs[id].k) * 1000 - TM_LEN;
+            if (lag_time < 0) lag_time = 0;
+            //printf("%li\n", lag_time);
+            usleep(lag_time);
             pcs[id].stanje = 1;
-
         }
     }
     return NULL;
@@ -320,10 +333,14 @@ int main(int argc, char *argv[]) {
 
     for (int i = 0; i < PC_CNT; i++)
         pthread_join(pc_threads[i], NULL);
+    printf("Joined pcs\n");
 
     pthread_join(timet, NULL);
+    printf("Joined time\n");
     pthread_join(controlt, NULL);
+    printf("Joined control\n");
     pthread_join(transmit_thread, NULL);
+    printf("Joined transmit\n");
 
     pthread_mutex_destroy(&tm_lock);
     pthread_cond_destroy(&tm_intrpt_cond);
